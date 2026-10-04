@@ -1,24 +1,19 @@
 /// Flash loan arbitrage execution module
 /// Coordinates flash loans, swaps, and profit distribution for triangular arbitrage
 module predictionm::flash_loan_arbitrage {
-    use sui::coin::{Self, Coin};
+    use sui::coin;
     use sui::balance::{Self, Balance};
-    use sui::tx_context::{Self, TxContext};
+    use sui::clock::Clock;
     use cetusclmm::pool::{Self, Pool};
+    use cetusclmm::config::GlobalConfig;
     use std::string;
     use predictionm::cetus_data;
 
     // Error codes
-    const E_INSUFFICIENT_PROFIT: u64 = 100;
-    const E_FLASH_LOAN_FAILED: u64 = 101;
-    const E_SWAP_FAILED: u64 = 102;
-    const E_REPAYMENT_FAILED: u64 = 103;
     const E_SLIPPAGE_EXCEEDED: u64 = 104;
     const E_ZERO_AMOUNT: u64 = 105;
-    const E_INSUFFICIENT_LIQUIDITY: u64 = 106;
 
     // Constants
-    const MIN_PROFIT_BPS: u64 = 50;  // 0.5% minimum profit after all costs
     const MAX_SLIPPAGE_BPS: u64 = 100; // 1% max slippage
     const GAS_BUFFER: u64 = 1000000; // Gas buffer in MIST (0.001 SUI)
 
@@ -129,10 +124,10 @@ module predictionm::flash_loan_arbitrage {
     /// Internal function to execute the triangular arbitrage
     /// This coordinates all three swaps in sequence
     fun execute_triangular_arbitrage_internal<USDC, SUI, WAL>(
-        usdc_sui_pool: &mut Pool<USDC, SUI>,
-        wal_sui_pool: &mut Pool<WAL, SUI>,
-        wal_usdc_pool: &mut Pool<WAL, USDC>,
-        flash_loan_amount: u64,
+        _usdc_sui_pool: &Pool<USDC, SUI>,
+        _wal_sui_pool: &Pool<WAL, SUI>,
+        _wal_usdc_pool: &Pool<WAL, USDC>,
+        _flash_loan_amount: u64,
         estimated_gross_profit: u64,
         flash_loan_fee: u64,
         gas_estimate: u64,
@@ -164,35 +159,40 @@ module predictionm::flash_loan_arbitrage {
     /// Execute the three sequential swaps for triangular arbitrage
     /// Returns the final USDC balance after all swaps
     public fun execute_triangular_swaps<USDC, SUI, WAL>(
+        config: &GlobalConfig,
         usdc_sui_pool: &mut Pool<USDC, SUI>,
         wal_sui_pool: &mut Pool<WAL, SUI>,
         wal_usdc_pool: &mut Pool<WAL, USDC>,
         input_usdc: Balance<USDC>,
         min_output_amount: u64,
-        ctx: &mut TxContext
+        clock: &Clock,
+        _ctx: &mut TxContext
     ): Balance<USDC> {
         let input_amount = balance::value(&input_usdc);
         assert!(input_amount > 0, E_ZERO_AMOUNT);
 
         // Swap 1: USDC → SUI
         let sui_balance = swap_usdc_to_sui<USDC, SUI>(
+            config,
             usdc_sui_pool,
             input_usdc,
-            ctx
+            clock,
         );
 
         // Swap 2: SUI → WAL
         let wal_balance = swap_sui_to_wal<SUI, WAL>(
+            config,
             wal_sui_pool,
             sui_balance,
-            ctx
+            clock,
         );
 
         // Swap 3: WAL → USDC
         let final_usdc = swap_wal_to_usdc<WAL, USDC>(
+            config,
             wal_usdc_pool,
             wal_balance,
-            ctx
+            clock,
         );
 
         // Verify slippage protection
@@ -203,34 +203,143 @@ module predictionm::flash_loan_arbitrage {
     }
 
     /// Swap USDC to SUI using Cetus pool
+    /// Uses Cetus flash_swap mechanism
     fun swap_usdc_to_sui<USDC, SUI>(
+        config: &GlobalConfig,
         pool: &mut Pool<USDC, SUI>,
         usdc_balance: Balance<USDC>,
-        _ctx: &mut TxContext
+        clock: &Clock,
     ): Balance<SUI> {
-        // In production: Call cetusclmm::integrator::swap_exact_coin_for_coin
-        // For now, return zero balance as placeholder
-        balance::zero<SUI>()
+        let input_amount = balance::value(&usdc_balance);
+        assert!(input_amount > 0, E_ZERO_AMOUNT);
+
+        // For Pool<USDC, SUI>: USDC=A, SUI=B, so USDC->SUI is a2b
+        let a2b = true;
+        let by_amount_in = true;
+
+        // No price limit (use min price for a2b direction)
+        let sqrt_price_limit = 4295048016u128;
+
+        // Execute flash swap
+        let (balance_a, balance_b, receipt) = pool::flash_swap<USDC, SUI>(
+            config,
+            pool,
+            a2b,
+            by_amount_in,
+            input_amount,
+            sqrt_price_limit,
+            clock,
+        );
+
+        // Repay with USDC balance
+        // For a2b: pay with balance_a (USDC), return zero balance_b
+        pool::repay_flash_swap<USDC, SUI>(
+            config,
+            pool,
+            usdc_balance,              // Pay with USDC (balance_a)
+            balance::zero<SUI>(),      // Return zero SUI (we keep balance_b)
+            receipt
+        );
+
+        // Destroy the unused balance_a (should be zero)
+        balance::destroy_zero(balance_a);
+
+        // Return SUI balance (output)
+        balance_b
     }
 
     /// Swap SUI to WAL using Cetus pool
+    /// Note: Pool type is <WAL, SUI> but we're swapping SUI->WAL (b2a direction)
     fun swap_sui_to_wal<SUI, WAL>(
+        config: &GlobalConfig,
         pool: &mut Pool<WAL, SUI>,
         sui_balance: Balance<SUI>,
-        _ctx: &mut TxContext
+        clock: &Clock,
     ): Balance<WAL> {
-        // In production: Call cetusclmm::integrator::swap_exact_coin_for_coin
-        balance::zero<WAL>()
+        let input_amount = balance::value(&sui_balance);
+        assert!(input_amount > 0, E_ZERO_AMOUNT);
+
+        // For Pool<WAL, SUI>: WAL=A, SUI=B
+        // Swapping SUI->WAL (B->A) means a2b = false
+        let a2b = false;
+        let by_amount_in = true;
+
+        // Max price for b2a direction
+        let sqrt_price_limit = 79226673521066979257578248091u128;
+
+        // Execute flash swap
+        let (balance_a, balance_b, receipt) = pool::flash_swap<WAL, SUI>(
+            config,
+            pool,
+            a2b,
+            by_amount_in,
+            input_amount,
+            sqrt_price_limit,
+            clock,
+        );
+
+        // Repay with SUI balance
+        // For b2a: pay with balance_b (SUI), return zero balance_a
+        pool::repay_flash_swap<WAL, SUI>(
+            config,
+            pool,
+            balance::zero<WAL>(),      // Return zero WAL (we keep balance_a)
+            sui_balance,               // Pay with SUI (balance_b)
+            receipt
+        );
+
+        // Destroy the unused balance_b (should be zero)
+        balance::destroy_zero(balance_b);
+
+        // Return WAL balance (output)
+        balance_a
     }
 
     /// Swap WAL to USDC using Cetus pool
+    /// Pool type is <WAL, USDC>, swapping WAL->USDC (a2b direction)
     fun swap_wal_to_usdc<WAL, USDC>(
+        config: &GlobalConfig,
         pool: &mut Pool<WAL, USDC>,
         wal_balance: Balance<WAL>,
-        _ctx: &mut TxContext
+        clock: &Clock,
     ): Balance<USDC> {
-        // In production: Call cetusclmm::integrator::swap_exact_coin_for_coin
-        balance::zero<USDC>()
+        let input_amount = balance::value(&wal_balance);
+        assert!(input_amount > 0, E_ZERO_AMOUNT);
+
+        // For Pool<WAL, USDC>: WAL=A, USDC=B
+        // Swapping WAL->USDC (A->B) means a2b = true
+        let a2b = true;
+        let by_amount_in = true;
+
+        // Min price for a2b direction
+        let sqrt_price_limit = 4295048016u128;
+
+        // Execute flash swap
+        let (balance_a, balance_b, receipt) = pool::flash_swap<WAL, USDC>(
+            config,
+            pool,
+            a2b,
+            by_amount_in,
+            input_amount,
+            sqrt_price_limit,
+            clock,
+        );
+
+        // Repay with WAL balance
+        // For a2b: pay with balance_a (WAL), return zero balance_b
+        pool::repay_flash_swap<WAL, USDC>(
+            config,
+            pool,
+            wal_balance,               // Pay with WAL (balance_a)
+            balance::zero<USDC>(),     // Return zero USDC (we keep balance_b)
+            receipt
+        );
+
+        // Destroy the unused balance_a (should be zero)
+        balance::destroy_zero(balance_a);
+
+        // Return USDC balance (output)
+        balance_b
     }
 
     // ========== Helper Functions ==========

@@ -5,7 +5,6 @@
 /// Pool objects cannot be loaded by ID in Move due to dynamic field access limitations.
 /// See arbitrage_example.move for complete usage patterns.
 module predictionm::cetus_data {
-    use sui::object::{Self, ID};
     use sui::balance;
     use std::string::String;
     use integer_mate::i32::I32;
@@ -15,9 +14,9 @@ module predictionm::cetus_data {
     const E_PRICE_OVERFLOW: u64 = 1;
     const E_ZERO_LIQUIDITY: u64 = 4;
 
-    // Minimum profit threshold in basis points (50 = 0.5%)
+    // Minimum profit threshold in basis points (30 = 0.3%)
     // Can be overridden using calculate_arbitrage_with_threshold()
-    const MIN_PROFIT_BPS: u128 = 50;
+    const MIN_PROFIT_BPS: u128 = 30;
 
     /// Basic pool data structure containing essential pricing information
     public struct PoolInfo has copy, drop, store {

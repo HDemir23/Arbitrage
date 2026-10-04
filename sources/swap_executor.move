@@ -3,17 +3,15 @@
 module predictionm::swap_executor {
     use sui::coin::{Self, Coin};
     use sui::balance::{Self, Balance};
-    use sui::tx_context::{Self, TxContext};
+    use sui::clock::Clock;
     use cetusclmm::pool::{Self, Pool};
     use cetusclmm::config::GlobalConfig;
-    use std::option;
 
     // Error codes
     const E_ZERO_AMOUNT: u64 = 200;
     const E_SLIPPAGE_EXCEEDED: u64 = 201;
     const E_INSUFFICIENT_LIQUIDITY: u64 = 202;
     const E_SWAP_FAILED: u64 = 203;
-    const E_INVALID_POOL: u64 = 204;
     const E_PRICE_IMPACT_TOO_HIGH: u64 = 205;
 
     // Constants
@@ -39,14 +37,16 @@ module predictionm::swap_executor {
 
     // ========== Core Swap Functions ==========
 
-    /// Execute swap with exact input amount
-    /// This is a wrapper for Cetus CLMM swap_exact_coin_for_coin
+    /// Execute swap with exact input amount using Cetus flash_swap
+    /// Pool<CoinIn, CoinOut> where CoinIn = A, CoinOut = B
+    /// For A->B swap: a2b = true, we receive balance_b (output), pay with balance_a (input)
     public fun swap_exact_input<CoinIn, CoinOut>(
         config: &GlobalConfig,
         pool: &mut Pool<CoinIn, CoinOut>,
         input_coin: Coin<CoinIn>,
         min_output: u64,
         sqrt_price_limit: u128,
+        clock: &Clock,
         ctx: &mut TxContext
     ): Coin<CoinOut> {
         let input_amount = coin::value(&input_coin);
@@ -55,38 +55,134 @@ module predictionm::swap_executor {
         // Validate pool state
         validate_pool_state(pool, input_amount);
 
-        // In production, call actual Cetus swap:
-        // cetusclmm::integrator::swap_exact_coin_for_coin<CoinIn, CoinOut>(
-        //     config,
-        //     pool,
-        //     input_coin,
-        //     option::some(min_output),
-        //     option::some(sqrt_price_limit),
-        //     ctx
-        // )
+        // For Pool<CoinIn, CoinOut>: CoinIn = A, CoinOut = B
+        // Swapping A->B means a2b = true
+        let a2b = true;
+        let by_amount_in = true; // We specify input amount
 
-        // Placeholder: return zero coin
-        // In production, this would be replaced with actual swap result
-        coin::zero<CoinOut>(ctx)
+        // Calculate sqrt_price_limit if not provided (0 means no limit)
+        let price_limit = if (sqrt_price_limit == 0) {
+            if (a2b) { 4295048016 } // Min sqrt price for a2b
+            else { 79226673521066979257578248091 } // Max sqrt price for b2a
+        } else {
+            sqrt_price_limit
+        };
+
+        // Execute Cetus flash swap
+        // For a2b: returns (zero_balance_a, borrowed_balance_b, receipt)
+        let (balance_a, balance_b, receipt) = pool::flash_swap<CoinIn, CoinOut>(
+            config,
+            pool,
+            a2b,
+            by_amount_in,
+            input_amount,
+            price_limit,
+            clock,
+        );
+
+        // balance_b contains the output (CoinOut)
+        let output_amount = balance::value(&balance_b);
+
+        // Verify minimum output (slippage protection)
+        assert!(output_amount >= min_output, E_SLIPPAGE_EXCEEDED);
+
+        // Convert input coin to balance for repayment
+        let pay_amount = pool::swap_pay_amount(&receipt);
+        assert!(input_amount >= pay_amount, E_SWAP_FAILED);
+
+        let input_balance = coin::into_balance(input_coin);
+
+        // Repay the flash swap
+        // repay_flash_swap expects (balance_a, balance_b) regardless of swap direction
+        // For a2b swap: we pay with CoinIn (balance_a) and return empty balance_b
+        pool::repay_flash_swap<CoinIn, CoinOut>(
+            config,
+            pool,
+            input_balance,              // Pay with CoinIn (balance_a)
+            balance::zero<CoinOut>(),   // Return empty balance_b (we keep the output)
+            receipt
+        );
+
+        // Destroy the unused balance_a (should be zero from flash_swap)
+        balance::destroy_zero(balance_a);
+
+        // Convert output balance to coin and return
+        coin::from_balance(balance_b, ctx)
     }
 
-    /// Execute swap with exact output amount
+    /// Execute swap with exact output amount using Cetus flash_swap
+    /// Returns the exact output amount and any remaining input
     public fun swap_exact_output<CoinIn, CoinOut>(
         config: &GlobalConfig,
         pool: &mut Pool<CoinIn, CoinOut>,
         input_coin: Coin<CoinIn>,
         exact_output: u64,
         sqrt_price_limit: u128,
+        clock: &Clock,
         ctx: &mut TxContext
     ): (Coin<CoinOut>, Coin<CoinIn>) {
         assert!(exact_output > 0, E_ZERO_AMOUNT);
-        assert!(coin::value(&input_coin) > 0, E_ZERO_AMOUNT);
+        let input_amount = coin::value(&input_coin);
+        assert!(input_amount > 0, E_ZERO_AMOUNT);
 
-        // In production: Call cetusclmm swap with exact output
-        // Returns (output_coin, remaining_input_coin)
+        // Validate pool state
+        validate_pool_state(pool, input_amount);
 
-        // Placeholder
-        (coin::zero<CoinOut>(ctx), input_coin)
+        // For Pool<CoinIn, CoinOut>: swapping A->B means a2b = true
+        let a2b = true;
+        let by_amount_in = false; // We specify output amount, not input
+
+        // Calculate sqrt_price_limit if not provided
+        let price_limit = if (sqrt_price_limit == 0) {
+            if (a2b) { 4295048016 } // Min sqrt price for a2b
+            else { 79226673521066979257578248091 } // Max sqrt price for b2a
+        } else {
+            sqrt_price_limit
+        };
+
+        // Execute Cetus flash swap for exact output
+        let (balance_a, balance_b, receipt) = pool::flash_swap<CoinIn, CoinOut>(
+            config,
+            pool,
+            a2b,
+            by_amount_in,
+            exact_output,  // Specify desired output amount
+            price_limit,
+            clock,
+        );
+
+        // Verify we got the exact output we requested
+        let output_amount = balance::value(&balance_b);
+        assert!(output_amount >= exact_output, E_SWAP_FAILED);
+
+        // Get required payment amount from receipt
+        let pay_amount = pool::swap_pay_amount(&receipt);
+        assert!(input_amount >= pay_amount, E_SWAP_FAILED);
+
+        // Convert input coin to balance
+        let mut input_balance = coin::into_balance(input_coin);
+
+        // Split payment amount from input
+        let payment_balance = balance::split(&mut input_balance, pay_amount);
+
+        // Repay the flash swap
+        // For a2b swap: we pay with CoinIn (balance_a), return zero balance_b
+        pool::repay_flash_swap<CoinIn, CoinOut>(
+            config,
+            pool,
+            payment_balance,              // Pay with CoinIn (balance_a position)
+            balance::zero<CoinOut>(),     // Return zero balance_b (we keep the output)
+            receipt
+        );
+
+        // Destroy the unused balance_a (should be zero)
+        balance::destroy_zero(balance_a);
+
+        // Convert balances to coins and return
+        let output_coin = coin::from_balance(balance_b, ctx);
+        let remaining_input_coin = coin::from_balance(input_balance, ctx);
+
+        (output_coin, remaining_input_coin)
     }
 
     /// Multi-hop swap execution (for triangular arbitrage)
@@ -98,6 +194,7 @@ module predictionm::swap_executor {
         pool3: &mut Pool<Coin3, Coin4>,
         input_coin: Coin<Coin1>,
         min_final_output: u64,
+        clock: &Clock,
         ctx: &mut TxContext
     ): Coin<Coin4> {
         let input_amount = coin::value(&input_coin);
@@ -111,6 +208,7 @@ module predictionm::swap_executor {
             input_coin,
             min_output_1,
             0, // No price limit for intermediate swaps
+            clock,
             ctx
         );
 
@@ -123,17 +221,19 @@ module predictionm::swap_executor {
             coin2,
             min_output_2,
             0,
+            clock,
             ctx
         );
 
         // Hop 3: Coin3 → Coin4
-        let amount_3 = coin::value(&coin3);
+        let _amount_3 = coin::value(&coin3);
         let coin4 = swap_exact_input<Coin3, Coin4>(
             config,
             pool3,
             coin3,
             min_final_output,
             0,
+            clock,
             ctx
         );
 
@@ -152,6 +252,7 @@ module predictionm::swap_executor {
         pool: &mut Pool<CoinIn, CoinOut>,
         input_balance: Balance<CoinIn>,
         min_output: u64,
+        clock: &Clock,
         ctx: &mut TxContext
     ): Balance<CoinOut> {
         let input_coin = coin::from_balance(input_balance, ctx);
@@ -161,19 +262,23 @@ module predictionm::swap_executor {
             input_coin,
             min_output,
             0,
+            clock,
             ctx
         );
         coin::into_balance(output_coin)
     }
 
     /// Triangular swap using balances (for flash loan integration)
+    /// Note: Pool type order must match swap direction
+    /// For USDC→SUI→WAL→USDC: pools should be <USDC,SUI>, <SUI,WAL>, <WAL,USDC>
     public fun triangular_swap_balances<USDC, SUI, WAL>(
         config: &GlobalConfig,
         usdc_sui_pool: &mut Pool<USDC, SUI>,
-        wal_sui_pool: &mut Pool<WAL, SUI>,
+        sui_wal_pool: &mut Pool<SUI, WAL>,
         wal_usdc_pool: &mut Pool<WAL, USDC>,
         input_usdc: Balance<USDC>,
         min_final_usdc: u64,
+        clock: &Clock,
         ctx: &mut TxContext
     ): Balance<USDC> {
         // Convert balance to coin
@@ -183,10 +288,11 @@ module predictionm::swap_executor {
         let final_coin = execute_multi_hop_swap<USDC, SUI, WAL, USDC>(
             config,
             usdc_sui_pool,
-            wal_sui_pool,
+            sui_wal_pool,
             wal_usdc_pool,
             usdc_coin,
             min_final_usdc,
+            clock,
             ctx
         );
 
@@ -216,10 +322,10 @@ module predictionm::swap_executor {
         input_amount: u64
     ): u64 {
         // Get current pool state
-        let liquidity = pool::liquidity(pool);
+        let _liquidity = pool::liquidity(pool);
         let (balance_a_ref, balance_b_ref) = pool::balances(pool);
         let balance_a = balance::value(balance_a_ref);
-        let balance_b = balance::value(balance_b_ref);
+        let _balance_b = balance::value(balance_b_ref);
 
         // Calculate price impact based on input amount relative to pool size
         // price_impact = (input_amount / balance) * 10000 (in bps)
@@ -278,7 +384,7 @@ module predictionm::swap_executor {
     ): u64 {
         // In production, this would use Cetus price calculation
         // For now, return approximate calculation based on current price
-        let sqrt_price = pool::current_sqrt_price(pool);
+        let _sqrt_price = pool::current_sqrt_price(pool);
         let fee_rate = pool::fee_rate(pool);
 
         // Simplified calculation (in production, use Cetus math)
@@ -286,9 +392,9 @@ module predictionm::swap_executor {
         let fee_multiplier = 1000000 - fee_rate;
         let gross_output = if (is_a_to_b) {
             // Calculate based on sqrt_price
-            ((input_amount as u128) * fee_multiplier as u128) / 1000000
+            ((input_amount as u128) * (fee_multiplier as u128)) / 1000000
         } else {
-            ((input_amount as u128) * fee_multiplier as u128) / 1000000
+            ((input_amount as u128) * (fee_multiplier as u128)) / 1000000
         };
 
         (gross_output as u64)

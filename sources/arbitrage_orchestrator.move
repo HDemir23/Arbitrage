@@ -2,8 +2,7 @@
 /// This is the entry point for executing complete arbitrage transactions
 module predictionm::arbitrage_orchestrator {
     use sui::coin::{Self, Coin};
-    use sui::balance::{Self, Balance};
-    use sui::tx_context::{Self, TxContext};
+    use sui::clock::Clock;
     use sui::event;
     use cetusclmm::pool::Pool;
     use cetusclmm::config::GlobalConfig;
@@ -11,20 +10,14 @@ module predictionm::arbitrage_orchestrator {
 
     use predictionm::cetus_data;
     use predictionm::swap_executor;
-    use predictionm::profit_manager;
+    use predictionm::profit_manager::{Self, AdminCap, Treasury};
 
     // Error codes
     const E_NO_ARBITRAGE_OPPORTUNITY: u64 = 400;
-    const E_INSUFFICIENT_LIQUIDITY: u64 = 401;
-    const E_PROFIT_TOO_LOW: u64 = 402;
     const E_EXECUTION_FAILED: u64 = 403;
-    const E_PRICE_MOVED: u64 = 404;
-    const E_TIMEOUT: u64 = 405;
 
     // Constants
-    const MIN_PROFIT_BPS: u128 = 50; // 0.5%
     const MIN_LIQUIDITY_MULTIPLIER: u128 = 10; // Need 10x liquidity vs trade size
-    const EXECUTION_TIMEOUT_MS: u64 = 30000; // 30 seconds
 
     /// Complete arbitrage execution result
     public struct ArbitrageExecution has drop {
@@ -43,7 +36,7 @@ module predictionm::arbitrage_orchestrator {
         profit_bps: u128,
         estimated_profit: u64,
         usdc_sui_pool: address,
-        wal_sui_pool: address,
+        sui_wal_pool: address,
         wal_usdc_pool: address,
     }
 
@@ -67,23 +60,31 @@ module predictionm::arbitrage_orchestrator {
     // ========== Main Orchestration Functions ==========
 
     /// Complete arbitrage check and execution flow
-    /// This is the main entry point for automated arbitrage
-    public entry fun check_and_execute_arbitrage<USDC, SUI, WAL>(
+    /// Main entry point for automated arbitrage
+    /// ADMIN ONLY - requires AdminCap to execute
+    /// Note: Pool types must match swap path - for USDC→SUI→WAL→USDC we need:
+    ///   - Pool<USDC, SUI> for USDC→SUI
+    ///   - Pool<SUI, WAL> for SUI→WAL
+    ///   - Pool<WAL, USDC> for WAL→USDC
+    public fun check_and_execute_arbitrage<USDC, SUI, WAL>(
+        _admin: &AdminCap,  // Only admin can execute arbitrage
         config: &GlobalConfig,
         usdc_sui_pool: &mut Pool<USDC, SUI>,
-        wal_sui_pool: &mut Pool<WAL, SUI>,
+        sui_wal_pool: &mut Pool<SUI, WAL>,
         wal_usdc_pool: &mut Pool<WAL, USDC>,
+        treasury: &mut Treasury<USDC>,
         input_usdc: Coin<USDC>,
         min_profit_required: u64,
+        clock: &Clock,
         ctx: &mut TxContext
     ) {
-        let trader = tx_context::sender(ctx);
+        let admin = tx_context::sender(ctx);
         let input_amount = coin::value(&input_usdc);
 
         // Phase 1: Validate opportunity exists
         let opportunity_result = validate_arbitrage_opportunity<USDC, SUI, WAL>(
             usdc_sui_pool,
-            wal_sui_pool,
+            sui_wal_pool,
             wal_usdc_pool,
             input_amount,
             min_profit_required
@@ -91,9 +92,9 @@ module predictionm::arbitrage_orchestrator {
 
         if (!opportunity_result) {
             // No opportunity, return funds
-            transfer::public_transfer(input_usdc, trader);
+            transfer::public_transfer(input_usdc, admin);
             event::emit(ArbitrageFailedEvent {
-                trader,
+                trader: admin,
                 reason: E_NO_ARBITRAGE_OPPORTUNITY,
                 attempted_amount: input_amount,
             });
@@ -104,17 +105,20 @@ module predictionm::arbitrage_orchestrator {
         let execution_result = execute_arbitrage_swaps<USDC, SUI, WAL>(
             config,
             usdc_sui_pool,
-            wal_sui_pool,
+            sui_wal_pool,
             wal_usdc_pool,
+            treasury,
             input_usdc,
             min_profit_required,
+            admin,
+            clock,
             ctx
         );
 
         // Phase 3: Handle result
         if (execution_result.successful) {
             event::emit(ArbitrageExecutedEvent {
-                trader,
+                trader: admin,
                 input_amount: execution_result.input_amount,
                 output_amount: execution_result.output_amount,
                 net_profit: execution_result.net_profit,
@@ -123,7 +127,7 @@ module predictionm::arbitrage_orchestrator {
             });
         } else {
             event::emit(ArbitrageFailedEvent {
-                trader,
+                trader: admin,
                 reason: E_EXECUTION_FAILED,
                 attempted_amount: input_amount,
             });
@@ -133,7 +137,7 @@ module predictionm::arbitrage_orchestrator {
     /// Validate that arbitrage opportunity exists and is profitable
     public fun validate_arbitrage_opportunity<USDC, SUI, WAL>(
         usdc_sui_pool: &Pool<USDC, SUI>,
-        wal_sui_pool: &Pool<WAL, SUI>,
+        sui_wal_pool: &Pool<SUI, WAL>,
         wal_usdc_pool: &Pool<WAL, USDC>,
         input_amount: u64,
         min_profit: u64
@@ -147,7 +151,7 @@ module predictionm::arbitrage_orchestrator {
         );
 
         let price_wal_sui = cetus_data::get_price_data_from_pool(
-            wal_sui_pool,
+            sui_wal_pool,
             string::utf8(b"WAL"),
             string::utf8(b"SUI"),
             9, 9
@@ -174,7 +178,7 @@ module predictionm::arbitrage_orchestrator {
         // Step 3: Validate liquidity
         let liquidity_valid = validate_pool_liquidities<USDC, SUI, WAL>(
             usdc_sui_pool,
-            wal_sui_pool,
+            sui_wal_pool,
             wal_usdc_pool,
             input_amount
         );
@@ -196,7 +200,7 @@ module predictionm::arbitrage_orchestrator {
             profit_bps,
             estimated_profit: (estimated_profit as u64),
             usdc_sui_pool: @0x0, // Would be pool address in production
-            wal_sui_pool: @0x0,
+            sui_wal_pool: @0x0,
             wal_usdc_pool: @0x0,
         });
 
@@ -207,26 +211,30 @@ module predictionm::arbitrage_orchestrator {
     fun execute_arbitrage_swaps<USDC, SUI, WAL>(
         config: &GlobalConfig,
         usdc_sui_pool: &mut Pool<USDC, SUI>,
-        wal_sui_pool: &mut Pool<WAL, SUI>,
+        sui_wal_pool: &mut Pool<SUI, WAL>,
         wal_usdc_pool: &mut Pool<WAL, USDC>,
+        treasury: &mut Treasury<USDC>,
         input_usdc: Coin<USDC>,
         min_profit: u64,
+        admin: address,
+        clock: &Clock,
         ctx: &mut TxContext
     ): ArbitrageExecution {
         let input_amount = coin::value(&input_usdc);
-        let trader = tx_context::sender(ctx);
 
         // Calculate minimum acceptable output
         let min_output = input_amount + min_profit;
 
         // Execute multi-hop swap with error handling
+        // Note: Pool type must match swap direction (SUI,WAL not WAL,SUI)
         let output_usdc = swap_executor::execute_multi_hop_swap<USDC, SUI, WAL, USDC>(
             config,
             usdc_sui_pool,
-            wal_sui_pool,
+            sui_wal_pool,  // This should be Pool<SUI, WAL>
             wal_usdc_pool,
             input_usdc,
             min_output,
+            clock,
             ctx
         );
 
@@ -247,8 +255,9 @@ module predictionm::arbitrage_orchestrator {
             0
         };
 
-        // Transfer output to trader
-        transfer::public_transfer(output_usdc, trader);
+        // Deposit ALL profits to treasury (100%)
+        let profit_balance = coin::into_balance(output_usdc);
+        profit_manager::distribute_profit(profit_balance, treasury, admin);
 
         ArbitrageExecution {
             input_amount,
@@ -267,7 +276,7 @@ module predictionm::arbitrage_orchestrator {
     /// Validate all pools have sufficient liquidity
     fun validate_pool_liquidities<USDC, SUI, WAL>(
         usdc_sui_pool: &Pool<USDC, SUI>,
-        wal_sui_pool: &Pool<WAL, SUI>,
+        sui_wal_pool: &Pool<SUI, WAL>,
         wal_usdc_pool: &Pool<WAL, USDC>,
         input_amount: u64
     ): bool {
@@ -275,7 +284,7 @@ module predictionm::arbitrage_orchestrator {
 
         // Check each pool
         let valid_1 = swap_executor::is_pool_healthy(usdc_sui_pool, min_liquidity);
-        let valid_2 = swap_executor::is_pool_healthy(wal_sui_pool, min_liquidity);
+        let valid_2 = swap_executor::is_pool_healthy(sui_wal_pool, min_liquidity);
         let valid_3 = swap_executor::is_pool_healthy(wal_usdc_pool, min_liquidity);
 
         valid_1 && valid_2 && valid_3
@@ -284,7 +293,7 @@ module predictionm::arbitrage_orchestrator {
     /// Pre-flight checks before execution
     public fun pre_flight_check<USDC, SUI, WAL>(
         usdc_sui_pool: &Pool<USDC, SUI>,
-        wal_sui_pool: &Pool<WAL, SUI>,
+        sui_wal_pool: &Pool<SUI, WAL>,
         wal_usdc_pool: &Pool<WAL, USDC>,
         input_amount: u64,
         min_profit_bps: u64
@@ -292,7 +301,7 @@ module predictionm::arbitrage_orchestrator {
         // Check 1: Pools are healthy
         if (!validate_pool_liquidities<USDC, SUI, WAL>(
             usdc_sui_pool,
-            wal_sui_pool,
+            sui_wal_pool,
             wal_usdc_pool,
             input_amount
         )) {
@@ -308,7 +317,7 @@ module predictionm::arbitrage_orchestrator {
         );
 
         let price_wal_sui = cetus_data::get_price_data_from_pool(
-            wal_sui_pool,
+            sui_wal_pool,
             string::utf8(b"WAL"),
             string::utf8(b"SUI"),
             9, 9
@@ -336,7 +345,7 @@ module predictionm::arbitrage_orchestrator {
     /// Simulate arbitrage without executing (for testing/analysis)
     public fun simulate_arbitrage<USDC, SUI, WAL>(
         usdc_sui_pool: &Pool<USDC, SUI>,
-        wal_sui_pool: &Pool<WAL, SUI>,
+        sui_wal_pool: &Pool<SUI, WAL>,
         wal_usdc_pool: &Pool<WAL, USDC>,
         input_amount: u64
     ): (bool, u64, u64) {
@@ -349,7 +358,7 @@ module predictionm::arbitrage_orchestrator {
         );
 
         let price_wal_sui = cetus_data::get_price_data_from_pool(
-            wal_sui_pool,
+            sui_wal_pool,
             string::utf8(b"WAL"),
             string::utf8(b"SUI"),
             9, 9
@@ -379,7 +388,7 @@ module predictionm::arbitrage_orchestrator {
     /// Estimate output amount for arbitrage
     public fun estimate_arbitrage_output<USDC, SUI, WAL>(
         usdc_sui_pool: &Pool<USDC, SUI>,
-        wal_sui_pool: &Pool<WAL, SUI>,
+        sui_wal_pool: &Pool<SUI, WAL>,
         wal_usdc_pool: &Pool<WAL, USDC>,
         input_amount: u64
     ): u64 {
@@ -390,10 +399,10 @@ module predictionm::arbitrage_orchestrator {
             true
         );
 
-        let wal_amount = swap_executor::estimate_swap_output<WAL, SUI>(
-            wal_sui_pool,
+        let wal_amount = swap_executor::estimate_swap_output<SUI, WAL>(
+            sui_wal_pool,
             sui_amount,
-            false // SUI to WAL
+            true // SUI to WAL (a2b direction)
         );
 
         let usdc_amount = swap_executor::estimate_swap_output<WAL, USDC>(

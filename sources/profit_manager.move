@@ -1,24 +1,23 @@
 /// Profit calculation, tracking, and distribution module
 /// Handles gas cost accounting, profit distribution, and treasury management
 module predictionm::profit_manager {
-    use sui::coin::{Self, Coin};
+    use sui::coin;
     use sui::balance::{Self, Balance};
-    use sui::tx_context::{Self, TxContext};
-    use sui::object::{Self, UID};
     use sui::event;
-    use sui::transfer;
 
     // Error codes
     const E_INSUFFICIENT_PROFIT: u64 = 300;
     const E_ZERO_AMOUNT: u64 = 301;
-    const E_INVALID_DISTRIBUTION: u64 = 302;
-    const E_UNAUTHORIZED: u64 = 303;
 
     // Constants
-    const TREASURY_SHARE_BPS: u64 = 1000; // 10% goes to treasury
-    const REINVESTMENT_SHARE_BPS: u64 = 3000; // 30% for reinvestment
-    const TRADER_SHARE_BPS: u64 = 6000; // 60% to trader
+    const MIN_PROFIT_BPS: u64 = 30; // 0.3% minimum profit
     const BASIS_POINTS: u64 = 10000;
+
+    /// Admin capability - grants permission to withdraw from treasury and execute arbitrage
+    /// This is created once during module initialization and transferred to the deployer
+    public struct AdminCap has key, store {
+        id: UID,
+    }
 
     /// Profit tracking structure
     public struct ProfitTracker has key, store {
@@ -31,14 +30,12 @@ module predictionm::profit_manager {
         total_fees_paid: u64,
     }
 
-    /// Profit distribution result
+    /// Profit distribution result (simplified - all goes to treasury)
     public struct ProfitDistribution has drop {
         gross_profit: u64,
-        treasury_amount: u64,
-        reinvestment_amount: u64,
-        trader_amount: u64,
-        gas_costs: u64,
         net_profit: u64,
+        gas_costs: u64,
+        fees_paid: u64,
     }
 
     /// Treasury object for holding protocol profits
@@ -60,16 +57,35 @@ module predictionm::profit_manager {
     }
 
     public struct ProfitDistributedEvent has copy, drop {
-        trader: address,
-        trader_share: u64,
-        treasury_share: u64,
-        reinvestment_share: u64,
+        admin: address,
+        amount: u64,
+        treasury_balance: u64,
+    }
+
+    public struct WithdrawalEvent has copy, drop {
+        admin: address,
+        amount: u64,
+        recipient: address,
+        remaining_balance: u64,
     }
 
     public struct LossRecordedEvent has copy, drop {
         trader: address,
         loss_amount: u64,
         gas_costs: u64,
+    }
+
+    // ========== Initialization ==========
+
+    /// Module initializer - creates AdminCap and transfers to deployer
+    /// This is called automatically when the module is published
+    fun init(ctx: &mut TxContext) {
+        let admin_cap = AdminCap {
+            id: object::new(ctx),
+        };
+
+        // Transfer AdminCap to the deployer (you)
+        transfer::transfer(admin_cap, tx_context::sender(ctx));
     }
 
     // ========== Core Functions ==========
@@ -89,7 +105,7 @@ module predictionm::profit_manager {
         }
     }
 
-    /// Calculate profit distribution according to protocol shares
+    /// Calculate profit distribution (simplified - all to treasury)
     public fun calculate_profit_distribution(
         gross_profit: u64,
         gas_costs: u64,
@@ -101,75 +117,41 @@ module predictionm::profit_manager {
             0
         };
 
-        // Calculate shares
-        let treasury_amount = (net_profit * TREASURY_SHARE_BPS) / BASIS_POINTS;
-        let reinvestment_amount = (net_profit * REINVESTMENT_SHARE_BPS) / BASIS_POINTS;
-        let trader_amount = (net_profit * TRADER_SHARE_BPS) / BASIS_POINTS;
-
         ProfitDistribution {
             gross_profit,
-            treasury_amount,
-            reinvestment_amount,
-            trader_amount,
-            gas_costs,
             net_profit,
+            gas_costs,
+            fees_paid,
         }
     }
 
-    /// Distribute profit according to calculated shares
+    /// Distribute profit to treasury (100% goes to treasury)
     public fun distribute_profit<CoinType>(
         profit_balance: Balance<CoinType>,
-        distribution: &ProfitDistribution,
-        trader: address,
         treasury: &mut Treasury<CoinType>,
-        ctx: &mut TxContext
+        admin: address,
     ) {
-        let total_profit = balance::value(&profit_balance);
-        assert!(total_profit >= distribution.net_profit, E_INSUFFICIENT_PROFIT);
+        let profit_amount = balance::value(&profit_balance);
 
-        // Split profit into shares
-        let treasury_balance = balance::split(&mut profit_balance, distribution.treasury_amount);
-        let reinvestment_balance = balance::split(&mut profit_balance, distribution.reinvestment_amount);
-        // Remaining goes to trader
-
-        // Add to treasury
-        balance::join(&mut treasury.balance, treasury_balance);
-        treasury.total_collected = treasury.total_collected + distribution.treasury_amount;
-
-        // Send reinvestment to protocol address (could be staking, LP, etc.)
-        let reinvestment_coin = coin::from_balance(reinvestment_balance, ctx);
-        transfer::public_transfer(reinvestment_coin, trader); // For now, to trader
-
-        // Send trader share
-        let trader_coin = coin::from_balance(profit_balance, ctx);
-        transfer::public_transfer(trader_coin, trader);
+        // Add all profit to treasury
+        balance::join(&mut treasury.balance, profit_balance);
+        treasury.total_collected = treasury.total_collected + profit_amount;
 
         // Emit event
         event::emit(ProfitDistributedEvent {
-            trader,
-            trader_share: distribution.trader_amount,
-            treasury_share: distribution.treasury_amount,
-            reinvestment_share: distribution.reinvestment_amount,
+            admin,
+            amount: profit_amount,
+            treasury_balance: balance::value(&treasury.balance),
         });
     }
 
-    /// Simple profit distribution (all to trader)
-    public fun distribute_profit_simple<CoinType>(
+    /// Simple profit distribution to treasury (alternative interface)
+    public fun distribute_profit_to_treasury<CoinType>(
         profit_balance: Balance<CoinType>,
-        trader: address,
-        ctx: &mut TxContext
+        treasury: &mut Treasury<CoinType>,
+        admin: address,
     ) {
-        let profit_amount = balance::value(&profit_balance);
-        let profit_coin = coin::from_balance(profit_balance, ctx);
-        transfer::public_transfer(profit_coin, trader);
-
-        event::emit(ProfitEarnedEvent {
-            trader,
-            gross_profit: profit_amount,
-            net_profit: profit_amount,
-            gas_costs: 0,
-            fees_paid: 0,
-        });
+        distribute_profit(profit_balance, treasury, admin)
     }
 
     // ========== Profit Tracker Functions ==========
@@ -249,8 +231,9 @@ module predictionm::profit_manager {
         }
     }
 
-    /// Withdraw from treasury (admin only in production)
+    /// Withdraw from treasury (admin only - requires AdminCap)
     public fun withdraw_from_treasury<CoinType>(
+        _admin: &AdminCap,  // Requires admin capability
         treasury: &mut Treasury<CoinType>,
         amount: u64,
         recipient: address,
@@ -264,6 +247,14 @@ module predictionm::profit_manager {
         transfer::public_transfer(coin, recipient);
 
         treasury.withdrawal_count = treasury.withdrawal_count + 1;
+
+        // Emit withdrawal event
+        event::emit(WithdrawalEvent {
+            admin: tx_context::sender(ctx),
+            amount,
+            recipient,
+            remaining_balance: balance::value(&treasury.balance),
+        });
     }
 
     /// Get treasury balance
@@ -309,23 +300,18 @@ module predictionm::profit_manager {
 
     // ========== Validation Functions ==========
 
-    /// Validate profit distribution percentages sum to 100%
-    public fun validate_distribution_shares(
-        treasury_bps: u64,
-        reinvestment_bps: u64,
-        trader_bps: u64
-    ): bool {
-        treasury_bps + reinvestment_bps + trader_bps == BASIS_POINTS
-    }
-
-    /// Check if trade meets minimum profit requirements
+    /// Check if trade meets minimum profit requirements (0.3%)
     public fun meets_min_profit_requirement(
         net_profit: u64,
-        min_profit_bps: u64,
         principal_amount: u64
     ): bool {
-        let min_required = (principal_amount * min_profit_bps) / BASIS_POINTS;
+        let min_required = (principal_amount * MIN_PROFIT_BPS) / BASIS_POINTS;
         net_profit >= min_required
+    }
+
+    /// Get minimum profit threshold in basis points
+    public fun get_min_profit_bps(): u64 {
+        MIN_PROFIT_BPS
     }
 
     // ========== Getter Functions ==========
@@ -340,11 +326,9 @@ module predictionm::profit_manager {
 
     // ProfitDistribution getters
     public fun gross_profit(dist: &ProfitDistribution): u64 { dist.gross_profit }
-    public fun treasury_amount(dist: &ProfitDistribution): u64 { dist.treasury_amount }
-    public fun reinvestment_amount(dist: &ProfitDistribution): u64 { dist.reinvestment_amount }
-    public fun trader_amount(dist: &ProfitDistribution): u64 { dist.trader_amount }
-    public fun gas_costs(dist: &ProfitDistribution): u64 { dist.gas_costs }
     public fun net_profit(dist: &ProfitDistribution): u64 { dist.net_profit }
+    public fun gas_costs(dist: &ProfitDistribution): u64 { dist.gas_costs }
+    public fun fees_paid(dist: &ProfitDistribution): u64 { dist.fees_paid }
 
     // Treasury getters
     public fun total_collected<CoinType>(treasury: &Treasury<CoinType>): u64 { treasury.total_collected }
